@@ -65,17 +65,16 @@ function send_to_ai_api($post_content, $available_slugs) {
 function process_posts_batch() {
     $logs = array(); // Array to store logs
 
-    $logs[] = 'Processing posts batch...';
+    $logs[] = 'Starting to process a new batch of posts...';
     $nonce = $_POST['nonce'];
     $category_slug = $_POST['category_slug'];
     $batch_size = $_POST['batch_size'];
 
     if (!wp_verify_nonce($nonce, 'process_posts_batch')) {
-        $logs[] = 'Nonce verification failed';
+        $logs[] = 'Error: Security verification failed. Please refresh the page and try again.';
         wp_send_json_error(array('logs' => $logs));
         die();
     }
-    $logs[] = 'Nonce verification passed';
 
     // Fetch all existing category slugs
     $site_slugs = get_terms(array(
@@ -83,8 +82,6 @@ function process_posts_batch() {
         'hide_empty' => false,
         'fields' => 'slugs'
     ));
-
-    $logs[] = 'Available category slugs: ' . implode(', ', $site_slugs);
 
     // Process a batch of posts
     $args = array(
@@ -101,15 +98,16 @@ function process_posts_batch() {
 
     $query = new WP_Query($args);
     $post_count = $query->post_count;
-    $logs[] = 'Fetched ' . $post_count . ' posts for processing';
+    $logs[] = 'Found ' . $post_count . ' post(s) to process in this batch.';
     $processed_count = 0;
 
     if ($query->have_posts()) {
         while ($query->have_posts()) {
             $query->the_post();
             $post_id = get_the_ID();
+            $post_title = get_the_title();
             $post_content = get_the_content();
-            $logs[] = 'Processing post ID: ' . $post_id;
+            $logs[] = 'Analyzing post: "' . $post_title . '"...';
 
             $response_data = send_to_ai_api($post_content, $site_slugs);
 
@@ -117,7 +115,7 @@ function process_posts_batch() {
                 $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
                 $categories = explode(',', $response_data->choices[0]->message->content);
 
-                $logs[] = 'AI response for post ID ' . $post_id . ': ' . $response_data->choices[0]->message->content;
+                $logs[] = 'AI suggested categories for "' . $post_title . '": ' . $response_data->choices[0]->message->content;
 
                 $category_ids = array();
                 foreach ($categories as $category) {
@@ -129,23 +127,23 @@ function process_posts_batch() {
 
                 if (!empty($category_ids)) {
                     wp_set_post_categories($post_id, $category_ids, false);
-                    $logs[] = 'Set categories for post ID: ' . $post_id;
                     update_post_meta($post_id, 'ai_auto_cat_processed', true);
                     $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                    $logs[] = 'Categories before: ' . implode(', ', $categories_before);
-                    $logs[] = 'Categories after: ' . implode(', ', $categories_after);
+                    $logs[] = 'Successfully updated categories for "' . $post_title . '". Old categories: ' . implode(', ', $categories_before) . ' -> New categories: ' . implode(', ', $categories_after);
                     $processed_count++;
+                } else {
+                    $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
                 }
             } else {
-                $logs[] = 'No response data or no categories in response for post ID: ' . $post_id;
+                $logs[] = 'Error: Could not get valid categories from AI for post: "' . $post_title . '".';
             }
         }
     } else {
-        $logs[] = 'No posts found for processing';
+        $logs[] = 'No eligible posts found for processing in this category.';
     }
 
     wp_reset_postdata();
-    $logs[] = 'Finished batch processing of posts. Processed: ' . $processed_count . ', Successfully categorized: ' . $processed_count . ', Errors: ' . ($post_count - $processed_count);
+    $logs[] = 'Finished processing this batch. Successfully categorized: ' . $processed_count . '. Errors/Skipped: ' . ($post_count - $processed_count) . '.';
 
     // Send logs to the client
     wp_send_json_success(array('logs' => $logs));
@@ -252,6 +250,16 @@ function ai_auto_cat_admin_page() {
         <input type="number" id="batch-size" min="1" max="500" value="10">
         <button id="process-posts" class="button button-primary">Process Posts</button>
         
+        <div class="ai-auto-cat-console-container">
+            <div class="ai-auto-cat-console-header">
+                <h3>Process Logs</h3>
+                <button type="button" id="clear-console" class="button">Clear Console</button>
+            </div>
+            <div id="ai-auto-cat-console" class="ai-auto-cat-console">
+                <div class="log-entry" style="color: #646970;">Ready to process posts. Click 'Process Posts' to begin...</div>
+            </div>
+        </div>
+
         <h2>Move Posts Between Categories</h2>
         <p>Select the old and new category slugs to move posts from one category to another.</p>
         <select id="old-category-slug">
@@ -300,12 +308,130 @@ function ai_auto_cat_admin_page() {
         .button-primary {
             margin-bottom: 20px;
         }
+
+        /* Simulated Console Styles */
+        .ai-auto-cat-console-container {
+            margin-top: 15px;
+            margin-bottom: 30px;
+            background: #fff;
+            border: 1px solid #c3c4c7;
+            box-shadow: 0 1px 1px rgba(0,0,0,.04);
+        }
+
+        .ai-auto-cat-console-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 15px;
+            border-bottom: 1px solid #c3c4c7;
+            background: #f6f7f7;
+        }
+
+        .ai-auto-cat-console-header h3 {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 600;
+            color: #1d2327;
+        }
+
+        .ai-auto-cat-console {
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #2c3338;
+            background-color: #fafafa;
+        }
+
+        .ai-auto-cat-console .log-entry {
+            margin-bottom: 6px;
+            border-bottom: 1px solid #f0f0f1;
+            padding-bottom: 4px;
+        }
+
+        .ai-auto-cat-console .log-entry:last-child {
+            margin-bottom: 0;
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .ai-auto-cat-console .log-time {
+            color: #646970;
+            margin-right: 8px;
+            font-size: 11px;
+        }
+
+        .ai-auto-cat-console .log-success {
+            color: #00a32a;
+            font-weight: 600;
+        }
+
+        .ai-auto-cat-console .log-error {
+            color: #d63638;
+            font-weight: 600;
+        }
+
+        .ai-auto-cat-console .log-warning {
+            color: #dba617;
+            font-weight: 600;
+        }
     </style>
     <script type="text/javascript">
+        // Function to append to console
+        function appendToConsole(message) {
+            var consoleDiv = document.getElementById('ai-auto-cat-console');
+
+            // Format time
+            var now = new Date();
+            var timeString = now.toLocaleTimeString([], { hour12: false });
+
+            // Check for message type based on content
+            var messageClass = '';
+            if (message.toLowerCase().includes('error:')) {
+                messageClass = 'log-error';
+            } else if (message.toLowerCase().includes('warning:')) {
+                messageClass = 'log-warning';
+            } else if (message.toLowerCase().includes('successfully')) {
+                messageClass = 'log-success';
+            }
+
+            // Create entry
+            var entry = document.createElement('div');
+            entry.className = 'log-entry';
+
+            var timeSpan = document.createElement('span');
+            timeSpan.className = 'log-time';
+            timeSpan.textContent = '[' + timeString + ']';
+
+            var msgSpan = document.createElement('span');
+            if (messageClass) {
+                msgSpan.className = messageClass;
+            }
+            msgSpan.textContent = message;
+
+            entry.appendChild(timeSpan);
+            entry.appendChild(msgSpan);
+
+            consoleDiv.appendChild(entry);
+
+            // Auto scroll to bottom
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        // Clear console button listener
+        document.getElementById('clear-console').addEventListener('click', function() {
+            document.getElementById('ai-auto-cat-console').innerHTML = '';
+        });
+
         document.getElementById('process-posts').addEventListener('click', function() {
-            console.log('Processing posts...');
             var categorySlug = document.getElementById('category-slug').value;
             var batchSize = document.getElementById('batch-size').value;
+
+            appendToConsole('--- Starting Process Posts Task ---');
+            appendToConsole('Sending request to server. Please wait...');
+
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '<?php echo admin_url('admin-ajax.php'); ?>', true);
             xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
@@ -314,17 +440,24 @@ function ai_auto_cat_admin_page() {
                     var response = JSON.parse(this.responseText);
                     if (response.success) {
                         response.data.logs.forEach(function(log) {
-                            console.log(log);
+                            appendToConsole(log);
                         });
+                        appendToConsole('--- Process Posts Task Completed ---');
                     } else {
-                        console.error('Error:', response.data.logs.join('\n'));
+                        if (response.data && response.data.logs) {
+                            response.data.logs.forEach(function(log) {
+                                appendToConsole(log);
+                            });
+                        } else {
+                            appendToConsole('Error: Received an unexpected error format from server.');
+                        }
                     }
                 } else {
-                    console.error('Server error');
+                    appendToConsole('Error: Server returned status code ' + this.status);
                 }
             };
             xhr.onerror = function() {
-                console.error('Connection error');
+                appendToConsole('Error: A connection error occurred.');
             };
             xhr.send('action=process_posts_batch&nonce=<?php echo $process_nonce; ?>&category_slug=' + categorySlug + '&batch_size=' + batchSize);
         });
