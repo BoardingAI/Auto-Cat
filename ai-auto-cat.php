@@ -10,7 +10,7 @@
 // AI API URL
 define('AI_API_URL', 'https://api.openai.com/v1/chat/completions');
 
-function send_to_ai_api($post_content, $available_categories, $available_tags) {
+function send_to_ai_api($post_content, $available_categories, $available_tags, $min_cats, $max_cats, $min_tags, $max_tags) {
     error_log('Sending post content to AI API...');
     
     $api_key = get_option('ai_auto_cat_api_key');
@@ -19,18 +19,19 @@ function send_to_ai_api($post_content, $available_categories, $available_tags) {
         return false;
     }
     
-    // Create a dynamic prompt with the available slugs
+    // Create a dynamic prompt with the available slugs and min/max limits
     $system_prompt = sprintf(
-        'You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign up to three relevant categories and up to five relevant tags per post, prioritizing the most appropriate ones first.
+        'You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign between %d and %d relevant categories, and between %d and %d relevant tags per post. Prioritize the most appropriate ones first.
 
 # Steps
 
 1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
 2. **Category and Tag Identification**:
  - Compare the contents topics with the categories and tags in the preset lists.
- - Select up to three most relevant categories and up to five most relevant tags that accurately represent the focus of the post.
+ - Select between %d and %d most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of %d, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
+ - Select between %d and %d most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of %d, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.
  - Ensure the first item in each list is the most relevant to the post content.
- - Only select categories and tags that EXACTLY match the provided lists. Do not generate new categories or tags.
+ - Only select categories and tags that EXACTLY match the provided lists.
 3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
 
 # Output Format
@@ -58,6 +59,9 @@ Respond with a JSON object containing two keys: "categories" and "tags". Both sh
 ```
 %s
 ```',
+        $min_cats, $max_cats, $min_tags, $max_tags,
+        $min_cats, $max_cats, $min_cats,
+        $min_tags, $max_tags, $min_tags,
         implode(', ', $available_categories),
         implode(', ', $available_tags)
     );
@@ -128,6 +132,12 @@ function process_posts_batch() {
         'fields' => 'slugs'
     ));
 
+    // Get min/max settings
+    $min_cats = intval(get_option('ai_auto_cat_min_categories', 1));
+    $max_cats = intval(get_option('ai_auto_cat_max_categories', 3));
+    $min_tags = intval(get_option('ai_auto_cat_min_tags', 1));
+    $max_tags = intval(get_option('ai_auto_cat_max_tags', 5));
+
     // Process a batch of posts
     $args = array(
         'post_type' => 'post',
@@ -154,7 +164,7 @@ function process_posts_batch() {
             $post_content = get_the_content();
             $logs[] = 'Analyzing post: "' . $post_title . '"...';
 
-            $response_data = send_to_ai_api($post_content, $site_slugs, $site_tags);
+            $response_data = send_to_ai_api($post_content, $site_slugs, $site_tags, $min_cats, $max_cats, $min_tags, $max_tags);
 
             if ($response_data && isset($response_data->choices[0]->message->content)) {
                 $ai_content = json_decode($response_data->choices[0]->message->content, true);
@@ -281,6 +291,10 @@ add_action('wp_ajax_nopriv_move_posts_between_categories', 'move_posts_between_c
 // Register settings
 function ai_auto_cat_register_settings() {
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_api_key');
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_categories', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_categories', array('default' => 3));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tags', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tags', array('default' => 5));
 }
 add_action('admin_init', 'ai_auto_cat_register_settings');
 
@@ -308,8 +322,26 @@ function ai_auto_cat_admin_page() {
             <?php settings_fields('ai_auto_cat_settings_group'); ?>
             <table class="form-table">
                 <tr valign="top">
-                <th scope="row">OpenAI API Key</th>
-                <td><input type="password" name="ai_auto_cat_api_key" value="<?php echo esc_attr(get_option('ai_auto_cat_api_key')); ?>" style="width: 300px;" /></td>
+                    <th scope="row">OpenAI API Key</th>
+                    <td><input type="password" name="ai_auto_cat_api_key" value="<?php echo esc_attr(get_option('ai_auto_cat_api_key')); ?>" style="width: 300px;" /></td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Min/Max Categories</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_min_categories" value="<?php echo esc_attr(get_option('ai_auto_cat_min_categories', 1)); ?>" min="0" style="width: 70px;" />
+                        <span> to </span>
+                        <input type="number" name="ai_auto_cat_max_categories" value="<?php echo esc_attr(get_option('ai_auto_cat_max_categories', 3)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">Set the minimum and maximum number of categories the AI should assign per post.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Min/Max Tags</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_min_tags" value="<?php echo esc_attr(get_option('ai_auto_cat_min_tags', 1)); ?>" min="0" style="width: 70px;" />
+                        <span> to </span>
+                        <input type="number" name="ai_auto_cat_max_tags" value="<?php echo esc_attr(get_option('ai_auto_cat_max_tags', 5)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">Set the minimum and maximum number of tags the AI should assign per post.</p>
+                    </td>
                 </tr>
             </table>
             <?php submit_button(); ?>
