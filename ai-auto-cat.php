@@ -19,17 +19,21 @@ function send_to_ai_api($post_content, $available_categories, $available_tags, $
         return false;
     }
     
-    // Create a dynamic prompt with the available slugs and min/max limits
-    $system_prompt = sprintf(
-        'You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign between %d and %d relevant categories, and between %d and %d relevant tags per post. Prioritize the most appropriate ones first.
+    // Create strings from the arrays
+    $available_categories_str = implode(', ', $available_categories);
+    $available_tags_str = implode(', ', $available_tags);
+
+    // Create a dynamic prompt with the available slugs and min/max limits using Heredoc
+    $system_prompt = <<<PROMPT
+You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign between {$min_cats} and {$max_cats} relevant categories, and between {$min_tags} and {$max_tags} relevant tags per post. Prioritize the most appropriate ones first.
 
 # Steps
 
 1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
 2. **Category and Tag Identification**:
  - Compare the contents topics with the categories and tags in the preset lists.
- - Select between %d and %d most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of %d, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
- - Select between %d and %d most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of %d, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.
+ - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
+ - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.
  - Ensure the first item in each list is the most relevant to the post content.
  - Only select categories and tags that EXACTLY match the provided lists.
 3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
@@ -52,19 +56,14 @@ Respond with a JSON object containing two keys: "categories" and "tags". Both sh
 
 `Preset Categorization List`:
 ```
-%s
+{$available_categories_str}
 ```
 
 `Preset Tag List`:
 ```
-%s
-```',
-        $min_cats, $max_cats, $min_tags, $max_tags,
-        $min_cats, $max_cats, $min_cats,
-        $min_tags, $max_tags, $min_tags,
-        implode(', ', $available_categories),
-        implode(', ', $available_tags)
-    );
+{$available_tags_str}
+```
+PROMPT;
 
     $headers = array(
         'Authorization' => 'Bearer ' . $api_key,
