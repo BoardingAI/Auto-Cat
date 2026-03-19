@@ -10,7 +10,7 @@
 // AI API URL
 define('AI_API_URL', 'https://api.openai.com/v1/chat/completions');
 
-function send_to_ai_api($post_content, $available_slugs) {
+function send_to_ai_api($post_content, $available_categories, $available_tags) {
     error_log('Sending post content to AI API...');
     
     $api_key = get_option('ai_auto_cat_api_key');
@@ -21,8 +21,45 @@ function send_to_ai_api($post_content, $available_slugs) {
     
     // Create a dynamic prompt with the available slugs
     $system_prompt = sprintf(
-        'You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization list to assign up to three relevant categories per post, prioritizing the most appropriate category first.\n\n# Steps\n\n1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.\n2. **Category Identification**:\n - Compare the contents topics with the categories in the preset list.\n - Select the three most relevant categories that accurately represent the focus of the post.\n - Ensure the first category in your list is the most relevant to the posts content.\n - If the content fits multiple categories, use a comma-separated list in descending order of relevance.\n3. **Hierarchy Considerations**: Remember that reviews is a parent category to airline-reviews, hotel-reviews, and lounge-reviews. Use the subcategory when a specific type of review is discussed.\n\n# Output Format\n\nProvide a single line output consisting of a comma-separated list of a maximum of three categories, starting with the most relevant category slug. \n\n# Examples\n\n- Input: A blog post about airline services and passenger experiences.\n- Output: airlines, airline-reviews, travel\n\n- Input: A detailed review of a new hotel in Paris.\n- Output: hotel-reviews, hotels, travel\n\n- Input: An article covering a recent industry conference.\n- Output: industry-news, news, travel\n\n# Notes\n\n- Ensure to accurately reflect the contents emphasis using the most specific categories available.\n- Maintain a consistent order of relevance with the primary category listed first.\n\n`Preset Categorization List`:\n```\n%s\n```',
-        implode(', ', $available_slugs)
+        'You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign up to three relevant categories and up to five relevant tags per post, prioritizing the most appropriate ones first.
+
+# Steps
+
+1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
+2. **Category and Tag Identification**:
+ - Compare the contents topics with the categories and tags in the preset lists.
+ - Select up to three most relevant categories and up to five most relevant tags that accurately represent the focus of the post.
+ - Ensure the first item in each list is the most relevant to the post content.
+ - Only select categories and tags that EXACTLY match the provided lists. Do not generate new categories or tags.
+3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
+
+# Output Format
+
+Respond with a JSON object containing two keys: "categories" and "tags". Both should contain a comma-separated list of the slugs you selected.
+
+```json
+{
+  "categories": "category1, category2, category3",
+  "tags": "tag1, tag2, tag3, tag4, tag5"
+}
+```
+
+# Notes
+
+- Ensure to accurately reflect the contents emphasis using the most specific categories and tags available.
+- Maintain a consistent order of relevance with the primary item listed first.
+
+`Preset Categorization List`:
+```
+%s
+```
+
+`Preset Tag List`:
+```
+%s
+```',
+        implode(', ', $available_categories),
+        implode(', ', $available_tags)
     );
 
     $headers = array(
@@ -32,6 +69,7 @@ function send_to_ai_api($post_content, $available_slugs) {
 
     $body = array(
         'model' => 'gpt-4o',
+        'response_format' => array('type' => 'json_object'),
         'messages' => array(
             array(
                 'role' => 'system',
@@ -83,6 +121,13 @@ function process_posts_batch() {
         'fields' => 'slugs'
     ));
 
+    // Fetch all existing tag slugs
+    $site_tags = get_terms(array(
+        'taxonomy' => 'post_tag',
+        'hide_empty' => false,
+        'fields' => 'slugs'
+    ));
+
     // Process a batch of posts
     $args = array(
         'post_type' => 'post',
@@ -109,33 +154,65 @@ function process_posts_batch() {
             $post_content = get_the_content();
             $logs[] = 'Analyzing post: "' . $post_title . '"...';
 
-            $response_data = send_to_ai_api($post_content, $site_slugs);
+            $response_data = send_to_ai_api($post_content, $site_slugs, $site_tags);
 
             if ($response_data && isset($response_data->choices[0]->message->content)) {
-                $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                $categories = explode(',', $response_data->choices[0]->message->content);
+                $ai_content = json_decode($response_data->choices[0]->message->content, true);
 
-                $logs[] = 'AI suggested categories for "' . $post_title . '": ' . $response_data->choices[0]->message->content;
+                if (is_array($ai_content)) {
+                    $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
+                    $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
 
-                $category_ids = array();
-                foreach ($categories as $category) {
-                    $term = get_term_by('slug', trim($category), 'category');
-                    if ($term) {
-                        $category_ids[] = $term->term_id;
+                    $logs[] = 'AI suggested categories for "' . $post_title . '": ' . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
+                    $logs[] = 'AI suggested tags for "' . $post_title . '": ' . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
+
+                    $category_ids = array();
+                    foreach ($categories as $category) {
+                        $term = get_term_by('slug', trim($category), 'category');
+                        if ($term) {
+                            $category_ids[] = $term->term_id;
+                        }
                     }
-                }
 
-                if (!empty($category_ids)) {
-                    wp_set_post_categories($post_id, $category_ids, false);
-                    update_post_meta($post_id, 'ai_auto_cat_processed', true);
-                    $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                    $logs[] = 'Successfully updated categories for "' . $post_title . '". Old categories: ' . implode(', ', $categories_before) . ' -> New categories: ' . implode(', ', $categories_after);
-                    $processed_count++;
+                    $tag_ids = array();
+                    foreach ($tags as $tag) {
+                        $term = get_term_by('slug', trim($tag), 'post_tag');
+                        if ($term) {
+                            $tag_ids[] = $term->term_id;
+                        }
+                    }
+
+                    $updated = false;
+
+                    if (!empty($category_ids)) {
+                        $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                        wp_set_post_categories($post_id, $category_ids, false);
+                        $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                        $logs[] = 'Successfully updated categories for "' . $post_title . '". Old categories: ' . implode(', ', $categories_before) . ' -> New categories: ' . implode(', ', $categories_after);
+                        $updated = true;
+                    } else {
+                        $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
+                    }
+
+                    if (!empty($tag_ids)) {
+                        $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                        wp_set_post_tags($post_id, $tag_ids, false);
+                        $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                        $logs[] = 'Successfully updated tags for "' . $post_title . '". Old tags: ' . implode(', ', $tags_before) . ' -> New tags: ' . implode(', ', $tags_after);
+                        $updated = true;
+                    } else {
+                        $logs[] = 'Warning: No valid tags could be assigned for "' . $post_title . '".';
+                    }
+
+                    if ($updated) {
+                        update_post_meta($post_id, 'ai_auto_cat_processed', true);
+                        $processed_count++;
+                    }
                 } else {
-                    $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
+                    $logs[] = 'Error: Received invalid JSON format from AI for post: "' . $post_title . '".';
                 }
             } else {
-                $logs[] = 'Error: Could not get valid categories from AI for post: "' . $post_title . '".';
+                $logs[] = 'Error: Could not get a valid response from AI for post: "' . $post_title . '".';
             }
         }
     } else {
