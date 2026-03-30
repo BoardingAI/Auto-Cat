@@ -168,9 +168,18 @@ function process_posts_batch() {
         $logs[] = 'Notice: Tagging is disabled in settings. AI will only assign categories.';
     }
 
+    // Get enabled post types
+    $enabled_post_types = get_option('ai_auto_cat_post_types', array('post'));
+    if (empty($enabled_post_types)) {
+        $logs[] = 'Error: No content types are selected in the plugin settings. Please select at least one content type to process.';
+        wp_send_json_error(array('logs' => $logs));
+        die();
+    }
+
     // Process a batch of posts
     $args = array(
-        'post_type' => 'post',
+        'post_type' => $enabled_post_types,
+        'post_status' => 'publish', // Only process published public content
         'posts_per_page' => $batch_size,
         'category_name' => $category_slug,
         'meta_query' => array(
@@ -183,16 +192,45 @@ function process_posts_batch() {
 
     $query = new WP_Query($args);
     $post_count = $query->post_count;
-    $logs[] = 'Found ' . $post_count . ' post(s) to process in this batch.';
+    $logs[] = 'Found ' . $post_count . ' item(s) to inspect in this batch.';
     $processed_count = 0;
+    $skipped_count = 0;
 
     if ($query->have_posts()) {
         while ($query->have_posts()) {
             $query->the_post();
             $post_id = get_the_ID();
-            $post_title = get_the_title();
+            $raw_title = get_the_title();
             $post_content = get_the_content();
-            $logs[] = 'Analyzing post: "' . $post_title . '"...';
+            $post_type = get_post_type();
+
+            // 1. Normalize and validate title
+            $clean_title = trim(strip_tags(html_entity_decode($raw_title)));
+            $display_title = empty($clean_title) ? "(untitled {$post_type} #{$post_id})" : $clean_title;
+
+            // 2. Normalize and validate content (Preflight check for URLs or extreme thin content)
+            // Strip shortcodes, all HTML tags, and then explicitly remove full URLs to see what text remains
+            $clean_content = strip_shortcodes($post_content);
+            $clean_content = wp_strip_all_tags($clean_content);
+            $clean_content = preg_replace('/\bhttps?:\/\/\S+/i', '', $clean_content); // Remove HTTP URLs
+            $clean_content = trim($clean_content);
+
+            // 3. Skip Logic
+            if (empty($clean_title) && strlen($clean_content) < 50) {
+                $logs[] = "Skipped {$post_type} #{$post_id} {$display_title}: Blank title and insufficient textual content.";
+                update_post_meta($post_id, 'ai_auto_cat_processed', 'skipped_blank_and_thin');
+                $skipped_count++;
+                continue;
+            }
+
+            if (strlen($clean_content) < 50) {
+                $logs[] = "Skipped {$post_type} #{$post_id} \"{$display_title}\": Insufficient textual content (e.g. URL-only or stub).";
+                update_post_meta($post_id, 'ai_auto_cat_processed', 'skipped_low_content');
+                $skipped_count++;
+                continue;
+            }
+
+            $logs[] = "Analyzing {$post_type} #{$post_id}: \"{$display_title}\"...";
 
             $response_data = send_to_ai_api($post_content, $site_slugs, $site_tags, $min_cats, $max_cats, $min_tags, $max_tags);
 
@@ -201,7 +239,7 @@ function process_posts_batch() {
 
                 if (is_array($ai_content)) {
                     $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
-                    $logs[] = 'AI suggested categories for "' . $post_title . '": ' . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
+                    $logs[] = "AI suggested categories for {$post_type} #{$post_id}: " . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
 
                     $category_ids = array();
                     foreach ($categories as $category) {
@@ -217,16 +255,16 @@ function process_posts_batch() {
                         $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
                         wp_set_post_categories($post_id, $category_ids, false);
                         $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                        $logs[] = 'Successfully updated categories for "' . $post_title . '". Old categories: ' . implode(', ', $categories_before) . ' -> New categories: ' . implode(', ', $categories_after);
+                        $logs[] = "Successfully updated categories for {$post_type} #{$post_id}. Old: " . implode(', ', $categories_before) . ' -> New: ' . implode(', ', $categories_after);
                         $updated = true;
                     } else {
-                        $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
+                        $logs[] = "Warning: No valid categories could be assigned for {$post_type} #{$post_id}.";
                     }
 
                     // Only process tags if tagging was enabled and candidates were found
                     if (!empty($site_tags)) {
                         $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
-                        $logs[] = 'AI suggested tags for "' . $post_title . '": ' . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
+                        $logs[] = "AI suggested tags for {$post_type} #{$post_id}: " . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
 
                         $tag_ids = array();
                         foreach ($tags as $tag) {
@@ -240,33 +278,38 @@ function process_posts_batch() {
                             $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
                             wp_set_post_tags($post_id, $tag_ids, false);
                             $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
-                            $logs[] = 'Successfully updated tags for "' . $post_title . '". Old tags: ' . implode(', ', $tags_before) . ' -> New tags: ' . implode(', ', $tags_after);
+                            $logs[] = "Successfully updated tags for {$post_type} #{$post_id}. Old: " . implode(', ', $tags_before) . ' -> New: ' . implode(', ', $tags_after);
                             $updated = true;
                         } else {
-                            $logs[] = 'Warning: No valid tags could be assigned for "' . $post_title . '".';
+                            $logs[] = "Warning: No valid tags could be assigned for {$post_type} #{$post_id}.";
                         }
                     } else {
-                        // Just an internal note for the developer reviewing the execution, the user already saw the batch-level notice
-                        // $logs[] = 'Tag assignment skipped for "' . $post_title . '" because tagging is disabled or candidate pool is empty.';
+                        // Intentional empty block: tag assignment deliberately bypassed.
                     }
 
                     if ($updated) {
                         update_post_meta($post_id, 'ai_auto_cat_processed', true);
                         $processed_count++;
+                    } else {
+                        // Mark as processed but flag that assignment failed so it doesn't loop forever
+                        update_post_meta($post_id, 'ai_auto_cat_processed', 'failed_assignment');
                     }
                 } else {
-                    $logs[] = 'Error: Received invalid JSON format from AI for post: "' . $post_title . '".';
+                    $logs[] = "Error: Received invalid JSON format from AI for {$post_type} #{$post_id}.";
+                    update_post_meta($post_id, 'ai_auto_cat_processed', 'failed_json');
                 }
             } else {
-                $logs[] = 'Error: Could not get a valid response from AI for post: "' . $post_title . '".';
+                $logs[] = "Error: Could not get a valid response from AI for {$post_type} #{$post_id}.";
+                update_post_meta($post_id, 'ai_auto_cat_processed', 'failed_api');
             }
         }
     } else {
-        $logs[] = 'No eligible posts found for processing in this category.';
+        $logs[] = 'No eligible content found for processing in this category/batch.';
     }
 
     wp_reset_postdata();
-    $logs[] = 'Finished processing this batch. Successfully categorized: ' . $processed_count . '. Errors/Skipped: ' . ($post_count - $processed_count) . '.';
+    $error_count = $post_count - $processed_count - $skipped_count;
+    $logs[] = "Finished processing this batch. Total inspected: {$post_count} | Successfully categorized: {$processed_count} | Skipped: {$skipped_count} | Errors/Failed: {$error_count}.";
 
     // Send logs to the client
     wp_send_json_success(array('logs' => $logs));
@@ -336,6 +379,9 @@ function ai_auto_cat_register_settings() {
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_enable_tags', array('default' => 1));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tag_candidates', array('default' => 50));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tag_usage', array('default' => 1));
+
+    // Content Processing Scope
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_post_types', array('default' => array('post')));
 }
 add_action('admin_init', 'ai_auto_cat_register_settings');
 
@@ -361,6 +407,31 @@ function ai_auto_cat_admin_page() {
         <h2>Plugin Settings</h2>
         <form method="post" action="options.php">
             <?php settings_fields('ai_auto_cat_settings_group'); ?>
+
+            <h3>General Scope</h3>
+            <p>Select which types of content are eligible for auto-categorization.</p>
+            <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Content Types to Process</th>
+                    <td>
+                        <fieldset>
+                            <legend class="screen-reader-text"><span>Content Types to Process</span></legend>
+                            <?php
+                            $saved_post_types = get_option('ai_auto_cat_post_types', array('post'));
+                            $public_post_types = get_post_types(array('public' => true), 'objects');
+                            foreach ($public_post_types as $pt) {
+                                if ($pt->name === 'attachment') continue; // Exclude attachments by default as they usually lack robust content bodies
+                                $checked = in_array($pt->name, $saved_post_types) ? 'checked="checked"' : '';
+                                echo '<label><input type="checkbox" name="ai_auto_cat_post_types[]" value="' . esc_attr($pt->name) . '" ' . $checked . '> ' . esc_html($pt->labels->singular_name) . ' (' . esc_html($pt->name) . ')</label><br>';
+                            }
+                            ?>
+                        </fieldset>
+                        <p class="description">Only these selected post types will be batched to the AI. Note: AI categorization relies on text content; ensure you select post types that actually contain written content bodies.</p>
+                    </td>
+                </tr>
+            </table>
+
+            <h3>API Configuration</h3>
             <table class="form-table">
                 <tr valign="top">
                     <th scope="row">OpenAI API Key</th>
