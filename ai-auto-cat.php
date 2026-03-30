@@ -10,7 +10,7 @@
 // AI API URL
 define('AI_API_URL', 'https://api.openai.com/v1/chat/completions');
 
-function send_to_ai_api($post_content, $available_slugs) {
+function send_to_ai_api($post_content, $available_categories, $available_tags, $min_cats, $max_cats, $min_tags, $max_tags) {
     error_log('Sending post content to AI API...');
     
     $api_key = get_option('ai_auto_cat_api_key');
@@ -19,11 +19,51 @@ function send_to_ai_api($post_content, $available_slugs) {
         return false;
     }
     
-    // Create a dynamic prompt with the available slugs
-    $system_prompt = sprintf(
-        'You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization list to assign up to three relevant categories per post, prioritizing the most appropriate category first.\n\n# Steps\n\n1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.\n2. **Category Identification**:\n - Compare the contents topics with the categories in the preset list.\n - Select the three most relevant categories that accurately represent the focus of the post.\n - Ensure the first category in your list is the most relevant to the posts content.\n - If the content fits multiple categories, use a comma-separated list in descending order of relevance.\n3. **Hierarchy Considerations**: Remember that reviews is a parent category to airline-reviews, hotel-reviews, and lounge-reviews. Use the subcategory when a specific type of review is discussed.\n\n# Output Format\n\nProvide a single line output consisting of a comma-separated list of a maximum of three categories, starting with the most relevant category slug. \n\n# Examples\n\n- Input: A blog post about airline services and passenger experiences.\n- Output: airlines, airline-reviews, travel\n\n- Input: A detailed review of a new hotel in Paris.\n- Output: hotel-reviews, hotels, travel\n\n- Input: An article covering a recent industry conference.\n- Output: industry-news, news, travel\n\n# Notes\n\n- Ensure to accurately reflect the contents emphasis using the most specific categories available.\n- Maintain a consistent order of relevance with the primary category listed first.\n\n`Preset Categorization List`:\n```\n%s\n```',
-        implode(', ', $available_slugs)
-    );
+    // Create strings from the arrays
+    $available_categories_str = implode(', ', $available_categories);
+    $available_tags_str = implode(', ', $available_tags);
+
+    // Create a dynamic prompt with the available slugs and min/max limits using Heredoc
+    $system_prompt = <<<PROMPT
+You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign between {$min_cats} and {$max_cats} relevant categories, and between {$min_tags} and {$max_tags} relevant tags per post. Prioritize the most appropriate ones first.
+
+# Steps
+
+1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
+2. **Category and Tag Identification**:
+ - Compare the contents topics with the categories and tags in the preset lists.
+ - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
+ - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.
+ - Ensure the first item in each list is the most relevant to the post content.
+ - Only select categories and tags that EXACTLY match the provided lists.
+3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
+
+# Output Format
+
+Respond with a JSON object containing two keys: "categories" and "tags". Both should contain a comma-separated list of the slugs you selected.
+
+```json
+{
+  "categories": "category1, category2, category3",
+  "tags": "tag1, tag2, tag3, tag4, tag5"
+}
+```
+
+# Notes
+
+- Ensure to accurately reflect the contents emphasis using the most specific categories and tags available.
+- Maintain a consistent order of relevance with the primary item listed first.
+
+`Preset Categorization List`:
+```
+{$available_categories_str}
+```
+
+`Preset Tag List`:
+```
+{$available_tags_str}
+```
+PROMPT;
 
     $headers = array(
         'Authorization' => 'Bearer ' . $api_key,
@@ -32,6 +72,7 @@ function send_to_ai_api($post_content, $available_slugs) {
 
     $body = array(
         'model' => 'gpt-4o',
+        'response_format' => array('type' => 'json_object'),
         'messages' => array(
             array(
                 'role' => 'system',
@@ -65,17 +106,16 @@ function send_to_ai_api($post_content, $available_slugs) {
 function process_posts_batch() {
     $logs = array(); // Array to store logs
 
-    $logs[] = 'Processing posts batch...';
+    $logs[] = 'Starting to process a new batch of posts...';
     $nonce = $_POST['nonce'];
     $category_slug = $_POST['category_slug'];
     $batch_size = $_POST['batch_size'];
 
     if (!wp_verify_nonce($nonce, 'process_posts_batch')) {
-        $logs[] = 'Nonce verification failed';
+        $logs[] = 'Error: Security verification failed. Please refresh the page and try again.';
         wp_send_json_error(array('logs' => $logs));
         die();
     }
-    $logs[] = 'Nonce verification passed';
 
     // Fetch all existing category slugs
     $site_slugs = get_terms(array(
@@ -84,7 +124,18 @@ function process_posts_batch() {
         'fields' => 'slugs'
     ));
 
-    $logs[] = 'Available category slugs: ' . implode(', ', $site_slugs);
+    // Fetch all existing tag slugs
+    $site_tags = get_terms(array(
+        'taxonomy' => 'post_tag',
+        'hide_empty' => false,
+        'fields' => 'slugs'
+    ));
+
+    // Get min/max settings
+    $min_cats = intval(get_option('ai_auto_cat_min_categories', 1));
+    $max_cats = intval(get_option('ai_auto_cat_max_categories', 3));
+    $min_tags = intval(get_option('ai_auto_cat_min_tags', 1));
+    $max_tags = intval(get_option('ai_auto_cat_max_tags', 5));
 
     // Process a batch of posts
     $args = array(
@@ -101,51 +152,84 @@ function process_posts_batch() {
 
     $query = new WP_Query($args);
     $post_count = $query->post_count;
-    $logs[] = 'Fetched ' . $post_count . ' posts for processing';
+    $logs[] = 'Found ' . $post_count . ' post(s) to process in this batch.';
     $processed_count = 0;
 
     if ($query->have_posts()) {
         while ($query->have_posts()) {
             $query->the_post();
             $post_id = get_the_ID();
+            $post_title = get_the_title();
             $post_content = get_the_content();
-            $logs[] = 'Processing post ID: ' . $post_id;
+            $logs[] = 'Analyzing post: "' . $post_title . '"...';
 
-            $response_data = send_to_ai_api($post_content, $site_slugs);
+            $response_data = send_to_ai_api($post_content, $site_slugs, $site_tags, $min_cats, $max_cats, $min_tags, $max_tags);
 
             if ($response_data && isset($response_data->choices[0]->message->content)) {
-                $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                $categories = explode(',', $response_data->choices[0]->message->content);
+                $ai_content = json_decode($response_data->choices[0]->message->content, true);
 
-                $logs[] = 'AI response for post ID ' . $post_id . ': ' . $response_data->choices[0]->message->content;
+                if (is_array($ai_content)) {
+                    $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
+                    $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
 
-                $category_ids = array();
-                foreach ($categories as $category) {
-                    $term = get_term_by('slug', trim($category), 'category');
-                    if ($term) {
-                        $category_ids[] = $term->term_id;
+                    $logs[] = 'AI suggested categories for "' . $post_title . '": ' . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
+                    $logs[] = 'AI suggested tags for "' . $post_title . '": ' . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
+
+                    $category_ids = array();
+                    foreach ($categories as $category) {
+                        $term = get_term_by('slug', trim($category), 'category');
+                        if ($term) {
+                            $category_ids[] = $term->term_id;
+                        }
                     }
-                }
 
-                if (!empty($category_ids)) {
-                    wp_set_post_categories($post_id, $category_ids, false);
-                    $logs[] = 'Set categories for post ID: ' . $post_id;
-                    update_post_meta($post_id, 'ai_auto_cat_processed', true);
-                    $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                    $logs[] = 'Categories before: ' . implode(', ', $categories_before);
-                    $logs[] = 'Categories after: ' . implode(', ', $categories_after);
-                    $processed_count++;
+                    $tag_ids = array();
+                    foreach ($tags as $tag) {
+                        $term = get_term_by('slug', trim($tag), 'post_tag');
+                        if ($term) {
+                            $tag_ids[] = $term->term_id;
+                        }
+                    }
+
+                    $updated = false;
+
+                    if (!empty($category_ids)) {
+                        $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                        wp_set_post_categories($post_id, $category_ids, false);
+                        $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                        $logs[] = 'Successfully updated categories for "' . $post_title . '". Old categories: ' . implode(', ', $categories_before) . ' -> New categories: ' . implode(', ', $categories_after);
+                        $updated = true;
+                    } else {
+                        $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
+                    }
+
+                    if (!empty($tag_ids)) {
+                        $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                        wp_set_post_tags($post_id, $tag_ids, false);
+                        $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                        $logs[] = 'Successfully updated tags for "' . $post_title . '". Old tags: ' . implode(', ', $tags_before) . ' -> New tags: ' . implode(', ', $tags_after);
+                        $updated = true;
+                    } else {
+                        $logs[] = 'Warning: No valid tags could be assigned for "' . $post_title . '".';
+                    }
+
+                    if ($updated) {
+                        update_post_meta($post_id, 'ai_auto_cat_processed', true);
+                        $processed_count++;
+                    }
+                } else {
+                    $logs[] = 'Error: Received invalid JSON format from AI for post: "' . $post_title . '".';
                 }
             } else {
-                $logs[] = 'No response data or no categories in response for post ID: ' . $post_id;
+                $logs[] = 'Error: Could not get a valid response from AI for post: "' . $post_title . '".';
             }
         }
     } else {
-        $logs[] = 'No posts found for processing';
+        $logs[] = 'No eligible posts found for processing in this category.';
     }
 
     wp_reset_postdata();
-    $logs[] = 'Finished batch processing of posts. Processed: ' . $processed_count . ', Successfully categorized: ' . $processed_count . ', Errors: ' . ($post_count - $processed_count);
+    $logs[] = 'Finished processing this batch. Successfully categorized: ' . $processed_count . '. Errors/Skipped: ' . ($post_count - $processed_count) . '.';
 
     // Send logs to the client
     wp_send_json_success(array('logs' => $logs));
@@ -206,6 +290,10 @@ add_action('wp_ajax_nopriv_move_posts_between_categories', 'move_posts_between_c
 // Register settings
 function ai_auto_cat_register_settings() {
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_api_key');
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_categories', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_categories', array('default' => 3));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tags', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tags', array('default' => 5));
 }
 add_action('admin_init', 'ai_auto_cat_register_settings');
 
@@ -233,8 +321,26 @@ function ai_auto_cat_admin_page() {
             <?php settings_fields('ai_auto_cat_settings_group'); ?>
             <table class="form-table">
                 <tr valign="top">
-                <th scope="row">OpenAI API Key</th>
-                <td><input type="password" name="ai_auto_cat_api_key" value="<?php echo esc_attr(get_option('ai_auto_cat_api_key')); ?>" style="width: 300px;" /></td>
+                    <th scope="row">OpenAI API Key</th>
+                    <td><input type="password" name="ai_auto_cat_api_key" value="<?php echo esc_attr(get_option('ai_auto_cat_api_key')); ?>" style="width: 300px;" /></td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Min/Max Categories</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_min_categories" value="<?php echo esc_attr(get_option('ai_auto_cat_min_categories', 1)); ?>" min="0" style="width: 70px;" />
+                        <span> to </span>
+                        <input type="number" name="ai_auto_cat_max_categories" value="<?php echo esc_attr(get_option('ai_auto_cat_max_categories', 3)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">Set the minimum and maximum number of categories the AI should assign per post.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Min/Max Tags</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_min_tags" value="<?php echo esc_attr(get_option('ai_auto_cat_min_tags', 1)); ?>" min="0" style="width: 70px;" />
+                        <span> to </span>
+                        <input type="number" name="ai_auto_cat_max_tags" value="<?php echo esc_attr(get_option('ai_auto_cat_max_tags', 5)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">Set the minimum and maximum number of tags the AI should assign per post.</p>
+                    </td>
                 </tr>
             </table>
             <?php submit_button(); ?>
@@ -252,6 +358,16 @@ function ai_auto_cat_admin_page() {
         <input type="number" id="batch-size" min="1" max="500" value="10">
         <button id="process-posts" class="button button-primary">Process Posts</button>
         
+        <div class="ai-auto-cat-console-container">
+            <div class="ai-auto-cat-console-header">
+                <h3>Process Logs</h3>
+                <button type="button" id="clear-console" class="button">Clear Console</button>
+            </div>
+            <div id="ai-auto-cat-console" class="ai-auto-cat-console">
+                <div class="log-entry" style="color: #646970;">Ready to process posts. Click 'Process Posts' to begin...</div>
+            </div>
+        </div>
+
         <h2>Move Posts Between Categories</h2>
         <p>Select the old and new category slugs to move posts from one category to another.</p>
         <select id="old-category-slug">
@@ -300,12 +416,130 @@ function ai_auto_cat_admin_page() {
         .button-primary {
             margin-bottom: 20px;
         }
+
+        /* Simulated Console Styles */
+        .ai-auto-cat-console-container {
+            margin-top: 15px;
+            margin-bottom: 30px;
+            background: #fff;
+            border: 1px solid #c3c4c7;
+            box-shadow: 0 1px 1px rgba(0,0,0,.04);
+        }
+
+        .ai-auto-cat-console-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 15px;
+            border-bottom: 1px solid #c3c4c7;
+            background: #f6f7f7;
+        }
+
+        .ai-auto-cat-console-header h3 {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 600;
+            color: #1d2327;
+        }
+
+        .ai-auto-cat-console {
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #2c3338;
+            background-color: #fafafa;
+        }
+
+        .ai-auto-cat-console .log-entry {
+            margin-bottom: 6px;
+            border-bottom: 1px solid #f0f0f1;
+            padding-bottom: 4px;
+        }
+
+        .ai-auto-cat-console .log-entry:last-child {
+            margin-bottom: 0;
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .ai-auto-cat-console .log-time {
+            color: #646970;
+            margin-right: 8px;
+            font-size: 11px;
+        }
+
+        .ai-auto-cat-console .log-success {
+            color: #00a32a;
+            font-weight: 600;
+        }
+
+        .ai-auto-cat-console .log-error {
+            color: #d63638;
+            font-weight: 600;
+        }
+
+        .ai-auto-cat-console .log-warning {
+            color: #dba617;
+            font-weight: 600;
+        }
     </style>
     <script type="text/javascript">
+        // Function to append to console
+        function appendToConsole(message) {
+            var consoleDiv = document.getElementById('ai-auto-cat-console');
+
+            // Format time
+            var now = new Date();
+            var timeString = now.toLocaleTimeString([], { hour12: false });
+
+            // Check for message type based on content
+            var messageClass = '';
+            if (message.toLowerCase().includes('error:')) {
+                messageClass = 'log-error';
+            } else if (message.toLowerCase().includes('warning:')) {
+                messageClass = 'log-warning';
+            } else if (message.toLowerCase().includes('successfully')) {
+                messageClass = 'log-success';
+            }
+
+            // Create entry
+            var entry = document.createElement('div');
+            entry.className = 'log-entry';
+
+            var timeSpan = document.createElement('span');
+            timeSpan.className = 'log-time';
+            timeSpan.textContent = '[' + timeString + ']';
+
+            var msgSpan = document.createElement('span');
+            if (messageClass) {
+                msgSpan.className = messageClass;
+            }
+            msgSpan.textContent = message;
+
+            entry.appendChild(timeSpan);
+            entry.appendChild(msgSpan);
+
+            consoleDiv.appendChild(entry);
+
+            // Auto scroll to bottom
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        // Clear console button listener
+        document.getElementById('clear-console').addEventListener('click', function() {
+            document.getElementById('ai-auto-cat-console').innerHTML = '';
+        });
+
         document.getElementById('process-posts').addEventListener('click', function() {
-            console.log('Processing posts...');
             var categorySlug = document.getElementById('category-slug').value;
             var batchSize = document.getElementById('batch-size').value;
+
+            appendToConsole('--- Starting Process Posts Task ---');
+            appendToConsole('Sending request to server. Please wait...');
+
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '<?php echo admin_url('admin-ajax.php'); ?>', true);
             xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
@@ -314,17 +548,24 @@ function ai_auto_cat_admin_page() {
                     var response = JSON.parse(this.responseText);
                     if (response.success) {
                         response.data.logs.forEach(function(log) {
-                            console.log(log);
+                            appendToConsole(log);
                         });
+                        appendToConsole('--- Process Posts Task Completed ---');
                     } else {
-                        console.error('Error:', response.data.logs.join('\n'));
+                        if (response.data && response.data.logs) {
+                            response.data.logs.forEach(function(log) {
+                                appendToConsole(log);
+                            });
+                        } else {
+                            appendToConsole('Error: Received an unexpected error format from server.');
+                        }
                     }
                 } else {
-                    console.error('Server error');
+                    appendToConsole('Error: Server returned status code ' + this.status);
                 }
             };
             xhr.onerror = function() {
-                console.error('Connection error');
+                appendToConsole('Error: A connection error occurred.');
             };
             xhr.send('action=process_posts_batch&nonce=<?php echo $process_nonce; ?>&category_slug=' + categorySlug + '&batch_size=' + batchSize);
         });
