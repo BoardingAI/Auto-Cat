@@ -124,11 +124,16 @@ function process_posts_batch() {
         'fields' => 'slugs'
     ));
 
-    // Fetch all existing tag slugs
+    // Fetch all existing tag slugs, filtering and limiting to top 50 by usage count
     $site_tags = get_terms(array(
         'taxonomy' => 'post_tag',
-        'hide_empty' => false,
-        'fields' => 'slugs'
+        'hide_empty' => true, // Only fetch tags with usage > 0
+        'number' => 50, // Limit to top 50
+        'orderby' => array(
+            'count' => 'DESC',
+            'slug' => 'ASC'
+        ),
+        'fields' => 'slugs' // Extract just the slugs for the AI API
     ));
 
     // Get min/max settings
@@ -340,6 +345,7 @@ function ai_auto_cat_admin_page() {
                         <span> to </span>
                         <input type="number" name="ai_auto_cat_max_tags" value="<?php echo esc_attr(get_option('ai_auto_cat_max_tags', 5)); ?>" min="1" style="width: 70px;" />
                         <p class="description">Set the minimum and maximum number of tags the AI should assign per post.</p>
+                        <p class="description" style="margin-top: 5px;"><em>(Note: Only existing tags with current usage are considered. If more than 50 used tags exist on the site, only the 50 most frequently used tags will be passed into the AI tagging workflow.)</em></p>
                     </td>
                 </tr>
             </table>
