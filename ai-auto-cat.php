@@ -23,46 +23,50 @@ function send_to_ai_api($post_content, $available_categories, $available_tags, $
     $available_categories_str = implode(', ', $available_categories);
     $available_tags_str = implode(', ', $available_tags);
 
+    // Create a dynamic prompt based on whether tag processing is enabled or filtered out
+    $has_tags = !empty($available_tags);
+    $tag_instruction = $has_tags ? ", and between {$min_tags} and {$max_tags} relevant tags per post" : "";
+    $tag_list_instruction = $has_tags ? "and tags in the preset lists" : "in the preset list";
+    $tag_selection = $has_tags ? " - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.\n" : "";
+    $exact_match = $has_tags ? "categories and tags" : "categories";
+    $json_keys = $has_tags ? 'two keys: "categories" and "tags"' : 'one key: "categories"';
+    $json_example = $has_tags ? "{\n  \"categories\": \"category1, category2, category3\",\n  \"tags\": \"tag1, tag2, tag3\"\n}" : "{\n  \"categories\": \"category1, category2, category3\"\n}";
+    $specific_emphasis = $has_tags ? "categories and tags" : "categories";
+
+    $tag_preset_block = $has_tags ? "\n`Preset Tag List`:\n```\n{$available_tags_str}\n```\n" : "";
+
     // Create a dynamic prompt with the available slugs and min/max limits using Heredoc
     $system_prompt = <<<PROMPT
-You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign between {$min_cats} and {$max_cats} relevant categories, and between {$min_tags} and {$max_tags} relevant tags per post. Prioritize the most appropriate ones first.
+You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization list to assign between {$min_cats} and {$max_cats} relevant categories{$tag_instruction}. Prioritize the most appropriate ones first.
 
 # Steps
 
 1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
 2. **Category and Tag Identification**:
- - Compare the contents topics with the categories and tags in the preset lists.
+ - Compare the contents topics with the categories {$tag_list_instruction}.
  - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
- - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.
- - Ensure the first item in each list is the most relevant to the post content.
- - Only select categories and tags that EXACTLY match the provided lists.
+{$tag_selection} - Ensure the first item in each list is the most relevant to the post content.
+ - Only select {$exact_match} that EXACTLY match the provided list(s).
 3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
 
 # Output Format
 
-Respond with a JSON object containing two keys: "categories" and "tags". Both should contain a comma-separated list of the slugs you selected.
+Respond with a JSON object containing {$json_keys}. It should contain a comma-separated list of the slugs you selected.
 
 ```json
-{
-  "categories": "category1, category2, category3",
-  "tags": "tag1, tag2, tag3, tag4, tag5"
-}
+{$json_example}
 ```
 
 # Notes
 
-- Ensure to accurately reflect the contents emphasis using the most specific categories and tags available.
+- Ensure to accurately reflect the contents emphasis using the most specific {$specific_emphasis} available.
 - Maintain a consistent order of relevance with the primary item listed first.
 
 `Preset Categorization List`:
 ```
 {$available_categories_str}
 ```
-
-`Preset Tag List`:
-```
-{$available_tags_str}
-```
+{$tag_preset_block}
 PROMPT;
 
     $headers = array(
@@ -124,23 +128,47 @@ function process_posts_batch() {
         'fields' => 'slugs'
     ));
 
-    // Fetch all existing tag slugs, filtering and limiting to top 50 by usage count
-    $site_tags = get_terms(array(
-        'taxonomy' => 'post_tag',
-        'hide_empty' => true, // Only fetch tags with usage > 0
-        'number' => 50, // Limit to top 50
-        'orderby' => array(
-            'count' => 'DESC',
-            'slug' => 'ASC'
-        ),
-        'fields' => 'slugs' // Extract just the slugs for the AI API
-    ));
-
     // Get min/max settings
     $min_cats = intval(get_option('ai_auto_cat_min_categories', 1));
     $max_cats = intval(get_option('ai_auto_cat_max_categories', 3));
     $min_tags = intval(get_option('ai_auto_cat_min_tags', 1));
     $max_tags = intval(get_option('ai_auto_cat_max_tags', 5));
+
+    // Get candidate pool safeguards
+    $enable_tags = get_option('ai_auto_cat_enable_tags', 1);
+    $max_tag_candidates = intval(get_option('ai_auto_cat_max_tag_candidates', 50));
+    $min_tag_usage = intval(get_option('ai_auto_cat_min_tag_usage', 1));
+
+    $site_tags = array();
+
+    if ($enable_tags) {
+        // Fetch existing tags, ordering by count descending
+        $tag_candidates = get_terms(array(
+            'taxonomy' => 'post_tag',
+            'hide_empty' => true,
+            'number' => $max_tag_candidates,
+            'orderby' => array(
+                'count' => 'DESC',
+                'slug' => 'ASC'
+            ),
+            'fields' => 'all' // Fetch full objects so we can check count
+        ));
+
+        // Filter out tags that don't meet the minimum usage threshold
+        if (!is_wp_error($tag_candidates)) {
+            foreach ($tag_candidates as $tag) {
+                if ($tag->count >= $min_tag_usage) {
+                    $site_tags[] = $tag->slug;
+                }
+            }
+        }
+
+        if (empty($site_tags)) {
+            $logs[] = 'Notice: Tagging is enabled, but no tags met the candidate pool requirements. AI will only assign categories.';
+        }
+    } else {
+        $logs[] = 'Notice: Tagging is disabled in settings. AI will only assign categories.';
+    }
 
     // Process a batch of posts
     $args = array(
@@ -299,6 +327,11 @@ function ai_auto_cat_register_settings() {
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_categories', array('default' => 3));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tags', array('default' => 1));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tags', array('default' => 5));
+
+    // Tag Candidate Pool Safeguards
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_enable_tags', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tag_candidates', array('default' => 50));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tag_usage', array('default' => 1));
 }
 add_action('admin_init', 'ai_auto_cat_register_settings');
 
@@ -345,10 +378,37 @@ function ai_auto_cat_admin_page() {
                         <span> to </span>
                         <input type="number" name="ai_auto_cat_max_tags" value="<?php echo esc_attr(get_option('ai_auto_cat_max_tags', 5)); ?>" min="1" style="width: 70px;" />
                         <p class="description">Set the minimum and maximum number of tags the AI should assign per post.</p>
-                        <p class="description" style="margin-top: 5px;"><em>(Note: Only existing tags with current usage are considered. If more than 50 used tags exist on the site, only the 50 most frequently used tags will be passed into the AI tagging workflow.)</em></p>
                     </td>
                 </tr>
             </table>
+
+            <h2>Tag Candidate Pool Safeguards</h2>
+            <p>Control the tags that are sent to the AI for consideration. These settings help filter out unused or low-value tags, improving the AI's tag assignments. This does not delete any tags.</p>
+            <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Enable Tagging</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_enable_tags" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_enable_tags" value="1" <?php checked(1, get_option('ai_auto_cat_enable_tags', 1), true); ?> />
+                        <p class="description">Uncheck this to completely disable tag processing. The AI will only assign categories.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Max Tag Candidates</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_max_tag_candidates" value="<?php echo esc_attr(get_option('ai_auto_cat_max_tag_candidates', 50)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">The maximum number of existing tags to pass into the AI workflow. Limits the pool to the most frequently used tags. (Default: 50)</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Minimum Tag Usage</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_min_tag_usage" value="<?php echo esc_attr(get_option('ai_auto_cat_min_tag_usage', 1)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">A tag must be assigned to at least this many posts to be considered by the AI. Use this to ignore one-off or noisy tags. (Default: 1)</p>
+                    </td>
+                </tr>
+            </table>
+
             <?php submit_button(); ?>
         </form>
 
