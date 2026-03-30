@@ -142,23 +142,21 @@ function process_posts_batch() {
     $site_tags = array();
 
     if ($enable_tags) {
-        // Fetch existing tags, ordering by count descending
+        // Fetch existing tags, ordering by count descending safely
         $tag_candidates = get_terms(array(
             'taxonomy' => 'post_tag',
             'hide_empty' => true,
             'number' => $max_tag_candidates,
-            'orderby' => array(
-                'count' => 'DESC',
-                'slug' => 'ASC'
-            ),
+            'orderby' => 'count',
+            'order' => 'DESC',
             'fields' => 'all' // Fetch full objects so we can check count
         ));
 
         // Filter out tags that don't meet the minimum usage threshold
-        if (!is_wp_error($tag_candidates)) {
+        if (!is_wp_error($tag_candidates) && is_array($tag_candidates)) {
             foreach ($tag_candidates as $tag) {
-                if ($tag->count >= $min_tag_usage) {
-                    $site_tags[] = $tag->slug;
+                if (isset($tag->count) && $tag->count >= $min_tag_usage && isset($tag->slug)) {
+                    $site_tags[] = (string) $tag->slug; // strictly strings
                 }
             }
         }
@@ -203,24 +201,13 @@ function process_posts_batch() {
 
                 if (is_array($ai_content)) {
                     $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
-                    $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
-
                     $logs[] = 'AI suggested categories for "' . $post_title . '": ' . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
-                    $logs[] = 'AI suggested tags for "' . $post_title . '": ' . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
 
                     $category_ids = array();
                     foreach ($categories as $category) {
                         $term = get_term_by('slug', trim($category), 'category');
                         if ($term) {
                             $category_ids[] = $term->term_id;
-                        }
-                    }
-
-                    $tag_ids = array();
-                    foreach ($tags as $tag) {
-                        $term = get_term_by('slug', trim($tag), 'post_tag');
-                        if ($term) {
-                            $tag_ids[] = $term->term_id;
                         }
                     }
 
@@ -236,14 +223,31 @@ function process_posts_batch() {
                         $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
                     }
 
-                    if (!empty($tag_ids)) {
-                        $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
-                        wp_set_post_tags($post_id, $tag_ids, false);
-                        $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
-                        $logs[] = 'Successfully updated tags for "' . $post_title . '". Old tags: ' . implode(', ', $tags_before) . ' -> New tags: ' . implode(', ', $tags_after);
-                        $updated = true;
+                    // Only process tags if tagging was enabled and candidates were found
+                    if (!empty($site_tags)) {
+                        $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
+                        $logs[] = 'AI suggested tags for "' . $post_title . '": ' . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
+
+                        $tag_ids = array();
+                        foreach ($tags as $tag) {
+                            $term = get_term_by('slug', trim($tag), 'post_tag');
+                            if ($term) {
+                                $tag_ids[] = $term->term_id;
+                            }
+                        }
+
+                        if (!empty($tag_ids)) {
+                            $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                            wp_set_post_tags($post_id, $tag_ids, false);
+                            $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                            $logs[] = 'Successfully updated tags for "' . $post_title . '". Old tags: ' . implode(', ', $tags_before) . ' -> New tags: ' . implode(', ', $tags_after);
+                            $updated = true;
+                        } else {
+                            $logs[] = 'Warning: No valid tags could be assigned for "' . $post_title . '".';
+                        }
                     } else {
-                        $logs[] = 'Warning: No valid tags could be assigned for "' . $post_title . '".';
+                        // Just an internal note for the developer reviewing the execution, the user already saw the batch-level notice
+                        // $logs[] = 'Tag assignment skipped for "' . $post_title . '" because tagging is disabled or candidate pool is empty.';
                     }
 
                     if ($updated) {
