@@ -23,35 +23,70 @@ function send_to_ai_api($post_content, $available_categories, $available_tags, $
     $available_categories_str = implode(', ', $available_categories);
     $available_tags_str = implode(', ', $available_tags);
 
-    // Create a dynamic prompt based on whether tag processing is enabled or filtered out
+    // Create a dynamic prompt based on whether processing is enabled for categories and/or tags
+    $has_cats = !empty($available_categories);
     $has_tags = !empty($available_tags);
-    $tag_instruction = $has_tags ? ", and between {$min_tags} and {$max_tags} relevant tags per post" : "";
-    $tag_list_instruction = $has_tags ? "and tags in the preset lists" : "in the preset list";
-    $tag_selection = $has_tags ? " - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.\n" : "";
-    $exact_match = $has_tags ? "categories and tags" : "categories";
-    $json_keys = $has_tags ? 'two keys: "categories" and "tags"' : 'one key: "categories"';
-    $json_example = $has_tags ? "{\n  \"categories\": \"category1, category2, category3\",\n  \"tags\": \"tag1, tag2, tag3\"\n}" : "{\n  \"categories\": \"category1, category2, category3\"\n}";
-    $specific_emphasis = $has_tags ? "categories and tags" : "categories";
 
-    $tag_preset_block = $has_tags ? "\n`Preset Tag List`:\n```\n{$available_tags_str}\n```\n" : "";
+    // Safety check (should be caught in batch, but adding defense-in-depth here)
+    if (!$has_cats && !$has_tags) {
+        error_log('Error: Both categories and tags are empty in AI prompt.');
+        return false;
+    }
+
+    $assignment_intros = array();
+    $identification_steps = array();
+    $exact_matches = array();
+    $json_key_names = array();
+    $json_example_lines = array();
+    $preset_blocks = array();
+    $emphasis_terms = array();
+
+    if ($has_cats) {
+        $assignment_intros[] = "between {$min_cats} and {$max_cats} relevant categories";
+        $identification_steps[] = " - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.";
+        $exact_matches[] = "categories";
+        $json_key_names[] = '"categories"';
+        $json_example_lines[] = "  \"categories\": \"category1, category2, category3\"";
+        $preset_blocks[] = "`Preset Categorization List`:\n```\n{$available_categories_str}\n```\n";
+        $emphasis_terms[] = "categories";
+    }
+
+    if ($has_tags) {
+        $assignment_intros[] = "between {$min_tags} and {$max_tags} relevant tags";
+        $identification_steps[] = " - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.";
+        $exact_matches[] = "tags";
+        $json_key_names[] = '"tags"';
+        $json_example_lines[] = "  \"tags\": \"tag1, tag2, tag3\"";
+        $preset_blocks[] = "`Preset Tag List`:\n```\n{$available_tags_str}\n```\n";
+        $emphasis_terms[] = "tags";
+    }
+
+    $assignment_instruction = implode(" and ", $assignment_intros);
+    $identification_instruction = implode("\n", $identification_steps);
+    $exact_match = implode(" and ", $exact_matches);
+    $json_keys = implode(" and ", $json_key_names);
+    $json_key_count = ($has_cats && $has_tags) ? "two keys" : "one key";
+    $json_example = "{\n" . implode(",\n", $json_example_lines) . "\n}";
+    $preset_block_output = implode("\n", $preset_blocks);
+    $specific_emphasis = implode(" and ", $emphasis_terms);
 
     // Create a dynamic prompt with the available slugs and min/max limits using Heredoc
     $system_prompt = <<<PROMPT
-You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization list to assign between {$min_cats} and {$max_cats} relevant categories{$tag_instruction}. Prioritize the most appropriate ones first.
+You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset list(s) to assign {$assignment_instruction} per post. Prioritize the most appropriate ones first.
 
 # Steps
 
 1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
 2. **Category and Tag Identification**:
- - Compare the contents topics with the categories {$tag_list_instruction}.
- - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
-{$tag_selection} - Ensure the first item in each list is the most relevant to the post content.
+ - Compare the contents topics with the available {$exact_match} in the preset list(s).
+{$identification_instruction}
+ - Ensure the first item in each list is the most relevant to the post content.
  - Only select {$exact_match} that EXACTLY match the provided list(s).
 3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
 
 # Output Format
 
-Respond with a JSON object containing {$json_keys}. It should contain a comma-separated list of the slugs you selected.
+Respond with a JSON object containing {$json_key_count}: {$json_keys}. It should contain a comma-separated list of the slugs you selected.
 
 ```json
 {$json_example}
@@ -62,11 +97,7 @@ Respond with a JSON object containing {$json_keys}. It should contain a comma-se
 - Ensure to accurately reflect the contents emphasis using the most specific {$specific_emphasis} available.
 - Maintain a consistent order of relevance with the primary item listed first.
 
-`Preset Categorization List`:
-```
-{$available_categories_str}
-```
-{$tag_preset_block}
+{$preset_block_output}
 PROMPT;
 
     $headers = array(
@@ -121,13 +152,6 @@ function process_posts_batch() {
         die();
     }
 
-    // Fetch all existing category slugs
-    $site_slugs = get_terms(array(
-        'taxonomy' => 'category',
-        'hide_empty' => false,
-        'fields' => 'slugs'
-    ));
-
     // Get min/max settings
     $min_cats = intval(get_option('ai_auto_cat_min_categories', 1));
     $max_cats = intval(get_option('ai_auto_cat_max_categories', 3));
@@ -135,9 +159,27 @@ function process_posts_batch() {
     $max_tags = intval(get_option('ai_auto_cat_max_tags', 5));
 
     // Get candidate pool safeguards
+    $enable_categories = get_option('ai_auto_cat_enable_categories', 1);
     $enable_tags = get_option('ai_auto_cat_enable_tags', 1);
     $max_tag_candidates = intval(get_option('ai_auto_cat_max_tag_candidates', 50));
     $min_tag_usage = intval(get_option('ai_auto_cat_min_tag_usage', 1));
+
+    if (!$enable_categories && !$enable_tags) {
+        $logs[] = 'Error: Both categories and tags are disabled in settings. Please enable at least one taxonomy to process.';
+        wp_send_json_error(array('logs' => $logs));
+        die();
+    }
+
+    $site_slugs = array();
+    if ($enable_categories) {
+        $site_slugs = get_terms(array(
+            'taxonomy' => 'category',
+            'hide_empty' => false,
+            'fields' => 'slugs'
+        ));
+    } else {
+        $logs[] = 'Notice: Categorization is disabled in settings. AI will only assign tags.';
+    }
 
     $site_tags = array();
 
@@ -238,27 +280,30 @@ function process_posts_batch() {
                 $ai_content = json_decode($response_data->choices[0]->message->content, true);
 
                 if (is_array($ai_content)) {
-                    $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
-                    $logs[] = "AI suggested categories for {$post_type} #{$post_id}: " . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
-
-                    $category_ids = array();
-                    foreach ($categories as $category) {
-                        $term = get_term_by('slug', trim($category), 'category');
-                        if ($term) {
-                            $category_ids[] = $term->term_id;
-                        }
-                    }
-
                     $updated = false;
 
-                    if (!empty($category_ids)) {
-                        $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                        wp_set_post_categories($post_id, $category_ids, false);
-                        $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                        $logs[] = "Successfully updated categories for {$post_type} #{$post_id}. Old: " . implode(', ', $categories_before) . ' -> New: ' . implode(', ', $categories_after);
-                        $updated = true;
-                    } else {
-                        $logs[] = "Warning: No valid categories could be assigned for {$post_type} #{$post_id}.";
+                    // Only process categories if categorization was enabled
+                    if (!empty($site_slugs)) {
+                        $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
+                        $logs[] = "AI suggested categories for {$post_type} #{$post_id}: " . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
+
+                        $category_ids = array();
+                        foreach ($categories as $category) {
+                            $term = get_term_by('slug', trim($category), 'category');
+                            if ($term) {
+                                $category_ids[] = $term->term_id;
+                            }
+                        }
+
+                        if (!empty($category_ids)) {
+                            $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                            wp_set_post_categories($post_id, $category_ids, false);
+                            $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                            $logs[] = "Successfully updated categories for {$post_type} #{$post_id}. Old: " . implode(', ', $categories_before) . ' -> New: ' . implode(', ', $categories_after);
+                            $updated = true;
+                        } else {
+                            $logs[] = "Warning: No valid categories could be assigned for {$post_type} #{$post_id}.";
+                        }
                     }
 
                     // Only process tags if tagging was enabled and candidates were found
@@ -375,7 +420,8 @@ function ai_auto_cat_register_settings() {
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tags', array('default' => 1));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tags', array('default' => 5));
 
-    // Tag Candidate Pool Safeguards
+    // Taxonomy & Candidate Pool Safeguards
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_enable_categories', array('default' => 1));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_enable_tags', array('default' => 1));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tag_candidates', array('default' => 50));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tag_usage', array('default' => 1));
@@ -457,15 +503,23 @@ function ai_auto_cat_admin_page() {
                 </tr>
             </table>
 
-            <h2>Tag Candidate Pool Safeguards</h2>
-            <p>Control the tags that are sent to the AI for consideration. These settings help filter out unused or low-value tags, improving the AI's tag assignments. This does not delete any tags.</p>
+            <h2>Taxonomy & Candidate Pool Safeguards</h2>
+            <p>Control the taxonomies that are sent to the AI for consideration. These settings help turn off unused features or filter out low-value tags, improving the AI's assignments. This does not delete any terms.</p>
             <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Enable Categorization</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_enable_categories" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_enable_categories" value="1" <?php checked(1, get_option('ai_auto_cat_enable_categories', 1), true); ?> />
+                        <p class="description">Uncheck this to completely disable category processing.</p>
+                    </td>
+                </tr>
                 <tr valign="top">
                     <th scope="row">Enable Tagging</th>
                     <td>
                         <input type="hidden" name="ai_auto_cat_enable_tags" value="0" />
                         <input type="checkbox" name="ai_auto_cat_enable_tags" value="1" <?php checked(1, get_option('ai_auto_cat_enable_tags', 1), true); ?> />
-                        <p class="description">Uncheck this to completely disable tag processing. The AI will only assign categories.</p>
+                        <p class="description">Uncheck this to completely disable tag processing.</p>
                     </td>
                 </tr>
                 <tr valign="top">
