@@ -223,7 +223,6 @@ function process_posts_batch() {
         'post_type' => $enabled_post_types,
         'post_status' => 'publish', // Only process published public content
         'posts_per_page' => $batch_size,
-        'category_name' => $category_slug,
         'meta_query' => array(
             array(
                 'key' => 'ai_auto_cat_processed',
@@ -231,6 +230,42 @@ function process_posts_batch() {
             )
         )
     );
+
+    if (!empty($category_slug)) {
+        $args['category_name'] = $category_slug;
+    }
+
+    // Non-Destructive Targeting Filters
+    $target_missing_cats = get_option('ai_auto_cat_target_missing_categories', 0);
+    $target_missing_tags = get_option('ai_auto_cat_target_missing_tags', 0);
+
+    if ($target_missing_cats || $target_missing_tags) {
+        $tax_query = array('relation' => 'AND');
+
+        if ($target_missing_cats) {
+            // Failsafe: if admin specifically requested processing a specific category_slug in the UI dropdown,
+            // targeting ONLY items missing categories globally would result in 0 posts. So we skip the filter.
+            if (!empty($category_slug)) {
+                $logs[] = 'Notice: "Missing Categories Only" targeting filter was ignored because a specific category was selected for processing.';
+            } else {
+                $tax_query[] = array(
+                    'taxonomy' => 'category',
+                    'operator' => 'NOT EXISTS'
+                );
+            }
+        }
+
+        if ($target_missing_tags) {
+            $tax_query[] = array(
+                'taxonomy' => 'post_tag',
+                'operator' => 'NOT EXISTS'
+            );
+        }
+
+        if (count($tax_query) > 1) { // > 1 because the first item is 'relation'
+            $args['tax_query'] = $tax_query;
+        }
+    }
 
     $query = new WP_Query($args);
     $post_count = $query->post_count;
@@ -428,6 +463,10 @@ function ai_auto_cat_register_settings() {
 
     // Content Processing Scope
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_post_types', array('default' => array('post')));
+
+    // Non-Destructive Targeting Filters
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_target_missing_categories', array('default' => 0));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_target_missing_tags', array('default' => 0));
 }
 add_action('admin_init', 'ai_auto_cat_register_settings');
 
@@ -534,6 +573,27 @@ function ai_auto_cat_admin_page() {
                     <td>
                         <input type="number" name="ai_auto_cat_min_tag_usage" value="<?php echo esc_attr(get_option('ai_auto_cat_min_tag_usage', 1)); ?>" min="1" style="width: 70px;" />
                         <p class="description">A tag must be assigned to at least this many posts to be considered by the AI. Use this to ignore one-off or noisy tags. (Default: 1)</p>
+                    </td>
+                </tr>
+            </table>
+
+            <h3>Non-Destructive Targeting Filters</h3>
+            <p>Restrict the batch processor to only target content that is currently <em>missing</em> categories or tags. This is useful for filling in gaps without re-processing content that has already been manually organized.</p>
+            <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Missing Categories Only</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_target_missing_categories" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_target_missing_categories" value="1" <?php checked(1, get_option('ai_auto_cat_target_missing_categories', 0), true); ?> />
+                        <p class="description">If checked, the processor will only target content that has <strong>0 categories</strong> assigned.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Missing Tags Only</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_target_missing_tags" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_target_missing_tags" value="1" <?php checked(1, get_option('ai_auto_cat_target_missing_tags', 0), true); ?> />
+                        <p class="description">If checked, the processor will only target content that has <strong>0 tags</strong> assigned.</p>
                     </td>
                 </tr>
             </table>
