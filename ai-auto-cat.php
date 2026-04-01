@@ -23,46 +23,81 @@ function send_to_ai_api($post_content, $available_categories, $available_tags, $
     $available_categories_str = implode(', ', $available_categories);
     $available_tags_str = implode(', ', $available_tags);
 
+    // Create a dynamic prompt based on whether processing is enabled for categories and/or tags
+    $has_cats = !empty($available_categories);
+    $has_tags = !empty($available_tags);
+
+    // Safety check (should be caught in batch, but adding defense-in-depth here)
+    if (!$has_cats && !$has_tags) {
+        error_log('Error: Both categories and tags are empty in AI prompt.');
+        return false;
+    }
+
+    $assignment_intros = array();
+    $identification_steps = array();
+    $exact_matches = array();
+    $json_key_names = array();
+    $json_example_lines = array();
+    $preset_blocks = array();
+    $emphasis_terms = array();
+
+    if ($has_cats) {
+        $assignment_intros[] = "between {$min_cats} and {$max_cats} relevant categories";
+        $identification_steps[] = " - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.";
+        $exact_matches[] = "categories";
+        $json_key_names[] = '"categories"';
+        $json_example_lines[] = "  \"categories\": \"category1, category2, category3\"";
+        $preset_blocks[] = "`Preset Categorization List`:\n```\n{$available_categories_str}\n```\n";
+        $emphasis_terms[] = "categories";
+    }
+
+    if ($has_tags) {
+        $assignment_intros[] = "between {$min_tags} and {$max_tags} relevant tags";
+        $identification_steps[] = " - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.";
+        $exact_matches[] = "tags";
+        $json_key_names[] = '"tags"';
+        $json_example_lines[] = "  \"tags\": \"tag1, tag2, tag3\"";
+        $preset_blocks[] = "`Preset Tag List`:\n```\n{$available_tags_str}\n```\n";
+        $emphasis_terms[] = "tags";
+    }
+
+    $assignment_instruction = implode(" and ", $assignment_intros);
+    $identification_instruction = implode("\n", $identification_steps);
+    $exact_match = implode(" and ", $exact_matches);
+    $json_keys = implode(" and ", $json_key_names);
+    $json_key_count = ($has_cats && $has_tags) ? "two keys" : "one key";
+    $json_example = "{\n" . implode(",\n", $json_example_lines) . "\n}";
+    $preset_block_output = implode("\n", $preset_blocks);
+    $specific_emphasis = implode(" and ", $emphasis_terms);
+
     // Create a dynamic prompt with the available slugs and min/max limits using Heredoc
     $system_prompt = <<<PROMPT
-You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset categorization and tag lists to assign between {$min_cats} and {$max_cats} relevant categories, and between {$min_tags} and {$max_tags} relevant tags per post. Prioritize the most appropriate ones first.
+You are an AI content categorization assistant. Analyze the provided blog post content to identify its main topic(s), theme(s), and area(s) of focus. Use the preset list(s) to assign {$assignment_instruction} per post. Prioritize the most appropriate ones first.
 
 # Steps
 
 1. **Read and Analyze**: Carefully examine the content to grasp the main ideas, themes, and specific topics discussed.
 2. **Category and Tag Identification**:
- - Compare the contents topics with the categories and tags in the preset lists.
- - Select between {$min_cats} and {$max_cats} most relevant categories. If you cannot find enough highly relevant categories to meet the minimum of {$min_cats}, do your best to pick the most acceptable general categories to meet the threshold, but under no circumstances should you invent new categories.
- - Select between {$min_tags} and {$max_tags} most relevant tags. If you cannot find enough highly relevant tags to meet the minimum of {$min_tags}, do your best to pick the most acceptable general tags to meet the threshold, but under no circumstances should you invent new tags.
+ - Compare the contents topics with the available {$exact_match} in the preset list(s).
+{$identification_instruction}
  - Ensure the first item in each list is the most relevant to the post content.
- - Only select categories and tags that EXACTLY match the provided lists.
+ - Only select {$exact_match} that EXACTLY match the provided list(s).
 3. **Hierarchy Considerations**: Infer hierarchical relationships directly from the given slugs (e.g. if you see both "reviews" and "hotel-reviews", prioritize the more specific one if applicable). Do not rely on hardcoded rules.
 
 # Output Format
 
-Respond with a JSON object containing two keys: "categories" and "tags". Both should contain a comma-separated list of the slugs you selected.
+Respond with a JSON object containing {$json_key_count}: {$json_keys}. It should contain a comma-separated list of the slugs you selected.
 
 ```json
-{
-  "categories": "category1, category2, category3",
-  "tags": "tag1, tag2, tag3, tag4, tag5"
-}
+{$json_example}
 ```
 
 # Notes
 
-- Ensure to accurately reflect the contents emphasis using the most specific categories and tags available.
+- Ensure to accurately reflect the contents emphasis using the most specific {$specific_emphasis} available.
 - Maintain a consistent order of relevance with the primary item listed first.
 
-`Preset Categorization List`:
-```
-{$available_categories_str}
-```
-
-`Preset Tag List`:
-```
-{$available_tags_str}
-```
+{$preset_block_output}
 PROMPT;
 
     $headers = array(
@@ -117,31 +152,77 @@ function process_posts_batch() {
         die();
     }
 
-    // Fetch all existing category slugs
-    $site_slugs = get_terms(array(
-        'taxonomy' => 'category',
-        'hide_empty' => false,
-        'fields' => 'slugs'
-    ));
-
-    // Fetch all existing tag slugs
-    $site_tags = get_terms(array(
-        'taxonomy' => 'post_tag',
-        'hide_empty' => false,
-        'fields' => 'slugs'
-    ));
-
     // Get min/max settings
     $min_cats = intval(get_option('ai_auto_cat_min_categories', 1));
     $max_cats = intval(get_option('ai_auto_cat_max_categories', 3));
     $min_tags = intval(get_option('ai_auto_cat_min_tags', 1));
     $max_tags = intval(get_option('ai_auto_cat_max_tags', 5));
 
+    // Get candidate pool safeguards
+    $enable_categories = get_option('ai_auto_cat_enable_categories', 1);
+    $enable_tags = get_option('ai_auto_cat_enable_tags', 1);
+    $max_tag_candidates = intval(get_option('ai_auto_cat_max_tag_candidates', 50));
+    $min_tag_usage = intval(get_option('ai_auto_cat_min_tag_usage', 1));
+
+    if (!$enable_categories && !$enable_tags) {
+        $logs[] = 'Error: Both categories and tags are disabled in settings. Please enable at least one taxonomy to process.';
+        wp_send_json_error(array('logs' => $logs));
+        die();
+    }
+
+    $site_slugs = array();
+    if ($enable_categories) {
+        $site_slugs = get_terms(array(
+            'taxonomy' => 'category',
+            'hide_empty' => false,
+            'fields' => 'slugs'
+        ));
+    } else {
+        $logs[] = 'Notice: Categorization is disabled in settings. AI will only assign tags.';
+    }
+
+    $site_tags = array();
+
+    if ($enable_tags) {
+        // Fetch existing tags, ordering by count descending safely
+        $tag_candidates = get_terms(array(
+            'taxonomy' => 'post_tag',
+            'hide_empty' => true,
+            'number' => $max_tag_candidates,
+            'orderby' => 'count',
+            'order' => 'DESC',
+            'fields' => 'all' // Fetch full objects so we can check count
+        ));
+
+        // Filter out tags that don't meet the minimum usage threshold
+        if (!is_wp_error($tag_candidates) && is_array($tag_candidates)) {
+            foreach ($tag_candidates as $tag) {
+                if (isset($tag->count) && $tag->count >= $min_tag_usage && isset($tag->slug)) {
+                    $site_tags[] = (string) $tag->slug; // strictly strings
+                }
+            }
+        }
+
+        if (empty($site_tags)) {
+            $logs[] = 'Notice: Tagging is enabled, but no tags met the candidate pool requirements. AI will only assign categories.';
+        }
+    } else {
+        $logs[] = 'Notice: Tagging is disabled in settings. AI will only assign categories.';
+    }
+
+    // Get enabled post types
+    $enabled_post_types = get_option('ai_auto_cat_post_types', array('post'));
+    if (empty($enabled_post_types)) {
+        $logs[] = 'Error: No content types are selected in the plugin settings. Please select at least one content type to process.';
+        wp_send_json_error(array('logs' => $logs));
+        die();
+    }
+
     // Process a batch of posts
     $args = array(
-        'post_type' => 'post',
+        'post_type' => $enabled_post_types,
+        'post_status' => 'publish', // Only process published public content
         'posts_per_page' => $batch_size,
-        'category_name' => $category_slug,
         'meta_query' => array(
             array(
                 'key' => 'ai_auto_cat_processed',
@@ -150,18 +231,83 @@ function process_posts_batch() {
         )
     );
 
+    if (!empty($category_slug)) {
+        $args['category_name'] = $category_slug;
+    }
+
+    // Non-Destructive Targeting Filters
+    $target_missing_cats = get_option('ai_auto_cat_target_missing_categories', 0);
+    $target_missing_tags = get_option('ai_auto_cat_target_missing_tags', 0);
+
+    if ($target_missing_cats || $target_missing_tags) {
+        $tax_query = array('relation' => 'AND');
+
+        if ($target_missing_cats) {
+            // Failsafe: if admin specifically requested processing a specific category_slug in the UI dropdown,
+            // targeting ONLY items missing categories globally would result in 0 posts. So we skip the filter.
+            if (!empty($category_slug)) {
+                $logs[] = 'Notice: "Missing Categories Only" targeting filter was ignored because a specific category was selected for processing.';
+            } else {
+                $tax_query[] = array(
+                    'taxonomy' => 'category',
+                    'operator' => 'NOT EXISTS'
+                );
+            }
+        }
+
+        if ($target_missing_tags) {
+            $tax_query[] = array(
+                'taxonomy' => 'post_tag',
+                'operator' => 'NOT EXISTS'
+            );
+        }
+
+        if (count($tax_query) > 1) { // > 1 because the first item is 'relation'
+            $args['tax_query'] = $tax_query;
+        }
+    }
+
     $query = new WP_Query($args);
     $post_count = $query->post_count;
-    $logs[] = 'Found ' . $post_count . ' post(s) to process in this batch.';
+    $logs[] = 'Found ' . $post_count . ' item(s) to inspect in this batch.';
     $processed_count = 0;
+    $skipped_count = 0;
 
     if ($query->have_posts()) {
         while ($query->have_posts()) {
             $query->the_post();
             $post_id = get_the_ID();
-            $post_title = get_the_title();
+            $raw_title = get_the_title();
             $post_content = get_the_content();
-            $logs[] = 'Analyzing post: "' . $post_title . '"...';
+            $post_type = get_post_type();
+
+            // 1. Normalize and validate title
+            $clean_title = trim(strip_tags(html_entity_decode($raw_title)));
+            $display_title = empty($clean_title) ? "(untitled {$post_type} #{$post_id})" : $clean_title;
+
+            // 2. Normalize and validate content (Preflight check for URLs or extreme thin content)
+            // Strip shortcodes, all HTML tags, and then explicitly remove full URLs to see what text remains
+            $clean_content = strip_shortcodes($post_content);
+            $clean_content = wp_strip_all_tags($clean_content);
+            $clean_content = preg_replace('/\bhttps?:\/\/\S+/i', '', $clean_content); // Remove HTTP URLs
+            $clean_content = trim($clean_content);
+
+            // 3. Skip Logic
+            if (empty($clean_title) && strlen($clean_content) < 50) {
+                $logs[] = "Skipped {$post_type} #{$post_id} {$display_title}: Blank title and insufficient textual content.";
+                update_post_meta($post_id, 'ai_auto_cat_processed', 'skipped_blank_and_thin');
+                $skipped_count++;
+                continue;
+            }
+
+            if (strlen($clean_content) < 50) {
+                $logs[] = "Skipped {$post_type} #{$post_id} \"{$display_title}\": Insufficient textual content (e.g. URL-only or stub).";
+                update_post_meta($post_id, 'ai_auto_cat_processed', 'skipped_low_content');
+                $skipped_count++;
+                continue;
+            }
+
+            $logs[] = "Analyzing {$post_type} #{$post_id}: \"{$display_title}\"...";
 
             $response_data = send_to_ai_api($post_content, $site_slugs, $site_tags, $min_cats, $max_cats, $min_tags, $max_tags);
 
@@ -169,67 +315,81 @@ function process_posts_batch() {
                 $ai_content = json_decode($response_data->choices[0]->message->content, true);
 
                 if (is_array($ai_content)) {
-                    $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
-                    $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
-
-                    $logs[] = 'AI suggested categories for "' . $post_title . '": ' . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
-                    $logs[] = 'AI suggested tags for "' . $post_title . '": ' . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
-
-                    $category_ids = array();
-                    foreach ($categories as $category) {
-                        $term = get_term_by('slug', trim($category), 'category');
-                        if ($term) {
-                            $category_ids[] = $term->term_id;
-                        }
-                    }
-
-                    $tag_ids = array();
-                    foreach ($tags as $tag) {
-                        $term = get_term_by('slug', trim($tag), 'post_tag');
-                        if ($term) {
-                            $tag_ids[] = $term->term_id;
-                        }
-                    }
-
                     $updated = false;
 
-                    if (!empty($category_ids)) {
-                        $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                        wp_set_post_categories($post_id, $category_ids, false);
-                        $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
-                        $logs[] = 'Successfully updated categories for "' . $post_title . '". Old categories: ' . implode(', ', $categories_before) . ' -> New categories: ' . implode(', ', $categories_after);
-                        $updated = true;
-                    } else {
-                        $logs[] = 'Warning: No valid categories could be assigned for "' . $post_title . '".';
+                    // Only process categories if categorization was enabled
+                    if (!empty($site_slugs)) {
+                        $categories = isset($ai_content['categories']) ? explode(',', $ai_content['categories']) : array();
+                        $logs[] = "AI suggested categories for {$post_type} #{$post_id}: " . (isset($ai_content['categories']) ? $ai_content['categories'] : 'None');
+
+                        $category_ids = array();
+                        foreach ($categories as $category) {
+                            $term = get_term_by('slug', trim($category), 'category');
+                            if ($term) {
+                                $category_ids[] = $term->term_id;
+                            }
+                        }
+
+                        if (!empty($category_ids)) {
+                            $categories_before = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                            wp_set_post_categories($post_id, $category_ids, false);
+                            $categories_after = wp_get_post_categories($post_id, array('fields' => 'slugs'));
+                            $logs[] = "Successfully updated categories for {$post_type} #{$post_id}. Old: " . implode(', ', $categories_before) . ' -> New: ' . implode(', ', $categories_after);
+                            $updated = true;
+                        } else {
+                            $logs[] = "Warning: No valid categories could be assigned for {$post_type} #{$post_id}.";
+                        }
                     }
 
-                    if (!empty($tag_ids)) {
-                        $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
-                        wp_set_post_tags($post_id, $tag_ids, false);
-                        $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
-                        $logs[] = 'Successfully updated tags for "' . $post_title . '". Old tags: ' . implode(', ', $tags_before) . ' -> New tags: ' . implode(', ', $tags_after);
-                        $updated = true;
+                    // Only process tags if tagging was enabled and candidates were found
+                    if (!empty($site_tags)) {
+                        $tags = isset($ai_content['tags']) ? explode(',', $ai_content['tags']) : array();
+                        $logs[] = "AI suggested tags for {$post_type} #{$post_id}: " . (isset($ai_content['tags']) ? $ai_content['tags'] : 'None');
+
+                        $tag_ids = array();
+                        foreach ($tags as $tag) {
+                            $term = get_term_by('slug', trim($tag), 'post_tag');
+                            if ($term) {
+                                $tag_ids[] = $term->term_id;
+                            }
+                        }
+
+                        if (!empty($tag_ids)) {
+                            $tags_before = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                            wp_set_post_tags($post_id, $tag_ids, false);
+                            $tags_after = wp_get_post_tags($post_id, array('fields' => 'slugs'));
+                            $logs[] = "Successfully updated tags for {$post_type} #{$post_id}. Old: " . implode(', ', $tags_before) . ' -> New: ' . implode(', ', $tags_after);
+                            $updated = true;
+                        } else {
+                            $logs[] = "Warning: No valid tags could be assigned for {$post_type} #{$post_id}.";
+                        }
                     } else {
-                        $logs[] = 'Warning: No valid tags could be assigned for "' . $post_title . '".';
+                        // Intentional empty block: tag assignment deliberately bypassed.
                     }
 
                     if ($updated) {
                         update_post_meta($post_id, 'ai_auto_cat_processed', true);
                         $processed_count++;
+                    } else {
+                        // Mark as processed but flag that assignment failed so it doesn't loop forever
+                        update_post_meta($post_id, 'ai_auto_cat_processed', 'failed_assignment');
                     }
                 } else {
-                    $logs[] = 'Error: Received invalid JSON format from AI for post: "' . $post_title . '".';
+                    $logs[] = "Error: Received invalid JSON format from AI for {$post_type} #{$post_id}.";
+                    update_post_meta($post_id, 'ai_auto_cat_processed', 'failed_json');
                 }
             } else {
-                $logs[] = 'Error: Could not get a valid response from AI for post: "' . $post_title . '".';
+                $logs[] = "Error: Could not get a valid response from AI for {$post_type} #{$post_id}.";
+                update_post_meta($post_id, 'ai_auto_cat_processed', 'failed_api');
             }
         }
     } else {
-        $logs[] = 'No eligible posts found for processing in this category.';
+        $logs[] = 'No eligible content found for processing in this category/batch.';
     }
 
     wp_reset_postdata();
-    $logs[] = 'Finished processing this batch. Successfully categorized: ' . $processed_count . '. Errors/Skipped: ' . ($post_count - $processed_count) . '.';
+    $error_count = $post_count - $processed_count - $skipped_count;
+    $logs[] = "Finished processing this batch. Total inspected: {$post_count} | Successfully categorized: {$processed_count} | Skipped: {$skipped_count} | Errors/Failed: {$error_count}.";
 
     // Send logs to the client
     wp_send_json_success(array('logs' => $logs));
@@ -294,6 +454,19 @@ function ai_auto_cat_register_settings() {
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_categories', array('default' => 3));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tags', array('default' => 1));
     register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tags', array('default' => 5));
+
+    // Taxonomy & Candidate Pool Safeguards
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_enable_categories', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_enable_tags', array('default' => 1));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_max_tag_candidates', array('default' => 50));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_min_tag_usage', array('default' => 1));
+
+    // Content Processing Scope
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_post_types', array('default' => array('post')));
+
+    // Non-Destructive Targeting Filters
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_target_missing_categories', array('default' => 0));
+    register_setting('ai_auto_cat_settings_group', 'ai_auto_cat_target_missing_tags', array('default' => 0));
 }
 add_action('admin_init', 'ai_auto_cat_register_settings');
 
@@ -319,6 +492,31 @@ function ai_auto_cat_admin_page() {
         <h2>Plugin Settings</h2>
         <form method="post" action="options.php">
             <?php settings_fields('ai_auto_cat_settings_group'); ?>
+
+            <h3>General Scope</h3>
+            <p>Select which types of content are eligible for auto-categorization.</p>
+            <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Content Types to Process</th>
+                    <td>
+                        <fieldset>
+                            <legend class="screen-reader-text"><span>Content Types to Process</span></legend>
+                            <?php
+                            $saved_post_types = get_option('ai_auto_cat_post_types', array('post'));
+                            $public_post_types = get_post_types(array('public' => true), 'objects');
+                            foreach ($public_post_types as $pt) {
+                                if ($pt->name === 'attachment') continue; // Exclude attachments by default as they usually lack robust content bodies
+                                $checked = in_array($pt->name, $saved_post_types) ? 'checked="checked"' : '';
+                                echo '<label><input type="checkbox" name="ai_auto_cat_post_types[]" value="' . esc_attr($pt->name) . '" ' . $checked . '> ' . esc_html($pt->labels->singular_name) . ' (' . esc_html($pt->name) . ')</label><br>';
+                            }
+                            ?>
+                        </fieldset>
+                        <p class="description">Only these selected post types will be batched to the AI. Note: AI categorization relies on text content; ensure you select post types that actually contain written content bodies.</p>
+                    </td>
+                </tr>
+            </table>
+
+            <h3>API Configuration</h3>
             <table class="form-table">
                 <tr valign="top">
                     <th scope="row">OpenAI API Key</th>
@@ -343,6 +541,63 @@ function ai_auto_cat_admin_page() {
                     </td>
                 </tr>
             </table>
+
+            <h2>Taxonomy & Candidate Pool Safeguards</h2>
+            <p>Control the taxonomies that are sent to the AI for consideration. These settings help turn off unused features or filter out low-value tags, improving the AI's assignments. This does not delete any terms.</p>
+            <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Enable Categorization</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_enable_categories" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_enable_categories" value="1" <?php checked(1, get_option('ai_auto_cat_enable_categories', 1), true); ?> />
+                        <p class="description">Uncheck this to completely disable category processing.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Enable Tagging</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_enable_tags" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_enable_tags" value="1" <?php checked(1, get_option('ai_auto_cat_enable_tags', 1), true); ?> />
+                        <p class="description">Uncheck this to completely disable tag processing.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Max Tag Candidates</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_max_tag_candidates" value="<?php echo esc_attr(get_option('ai_auto_cat_max_tag_candidates', 50)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">The maximum number of existing tags to pass into the AI workflow. Limits the pool to the most frequently used tags. (Default: 50)</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Minimum Tag Usage</th>
+                    <td>
+                        <input type="number" name="ai_auto_cat_min_tag_usage" value="<?php echo esc_attr(get_option('ai_auto_cat_min_tag_usage', 1)); ?>" min="1" style="width: 70px;" />
+                        <p class="description">A tag must be assigned to at least this many posts to be considered by the AI. Use this to ignore one-off or noisy tags. (Default: 1)</p>
+                    </td>
+                </tr>
+            </table>
+
+            <h3>Non-Destructive Targeting Filters</h3>
+            <p>Restrict the batch processor to only target content that is currently <em>missing</em> categories or tags. This is useful for filling in gaps without re-processing content that has already been manually organized.</p>
+            <table class="form-table">
+                <tr valign="top">
+                    <th scope="row">Missing Categories Only</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_target_missing_categories" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_target_missing_categories" value="1" <?php checked(1, get_option('ai_auto_cat_target_missing_categories', 0), true); ?> />
+                        <p class="description">If checked, the processor will only target content that has <strong>0 categories</strong> assigned.</p>
+                    </td>
+                </tr>
+                <tr valign="top">
+                    <th scope="row">Missing Tags Only</th>
+                    <td>
+                        <input type="hidden" name="ai_auto_cat_target_missing_tags" value="0" />
+                        <input type="checkbox" name="ai_auto_cat_target_missing_tags" value="1" <?php checked(1, get_option('ai_auto_cat_target_missing_tags', 0), true); ?> />
+                        <p class="description">If checked, the processor will only target content that has <strong>0 tags</strong> assigned.</p>
+                    </td>
+                </tr>
+            </table>
+
             <?php submit_button(); ?>
         </form>
 
